@@ -1,67 +1,98 @@
 # YardOptimiser
 
-A Mixed-Integer Linear Programming (MILP) system for optimal container slot allocation across multiple yard locations at PTC (Poh Tiong Choon) port terminal.
+A **Mixed-Integer Linear Programming (MILP)** system for optimal container slot allocation across multiple yard locations at PTC (Poh Tiong Choon) port terminal. Given an incoming container, the solver finds the single best available slot — minimising reshifting, respecting physical stacking rules, and grouping containers by customer.
 
-Given an incoming container's attributes (yard, size, laden status, ETA, customer ID), the solver recommends the best available slot using:
-- Physical stacking feasibility constraints (20ft / 40ft pairing)
-- ETA-based tier targeting with historical reshifting data
-- Customer grouping preference
-- Yard-specific laden penalty coefficients
+## The Optimisation Model
+
+### Problem
+Assigning an incoming container to the wrong slot creates costly reshifting operations later — containers stacked on top must be moved to access one below. The goal is to assign each incoming container to the slot that minimises expected future disruption.
+
+### Decision Variable
+A binary assignment vector **X ∈ {0,1}ⁿ** over all feasible candidate slots, with the constraint that exactly one slot is selected:
+
+```
+min   Σ score(i) · X(i)
+s.t.  Σ X(i) = 1
+      X(i) ∈ {0, 1}
+```
+
+### Feasibility Constraints
+Candidate slots are filtered before the MILP is built:
+
+- **20ft containers**: the slot must be unoccupied, and all tiers below it must be occupied (no floating containers)
+- **40ft containers**: two horizontally adjacent slots across consecutive blocks must both be unoccupied, at the same tier, with all tiers below both occupied
+
+### Objective Function
+Each candidate slot is scored as:
+
+```
+score = 1000 × tier_preference + slot_cost
+```
+
+**Tier preference** is derived from the container's ETA and historical reshifting data:
+- Short ETA (< 120h) → target higher tiers (container leaves soon, needs to be accessible)
+- Long ETA (≥ 120h) → target lower tiers (container stays long, stack above it)
+- A KNN lookup over historical movements (k=10 nearest by ETA) infers the target tier and adjusts it up or down based on average past reshifting
+
+**Slot cost** is the base repositioning cost from the yard layout, used as a tiebreaker within the same tier preference band.
+
+### Laden Penalty
+For laden (full) containers, yard-specific regression coefficients add a penalty based on tier:
+
+```
+laden_penalty = (laden_coef + laden_tier_coef × tier) × 100
+```
+
+Coefficients are empirically derived per yard from historical data.
+
+### Customer Grouping
+If the incoming customer already has containers in the yard, the solver prioritises slots in the same or adjacent blocks (within distance 3). Exact same-block placements with zero tier penalty take absolute priority.
+
+### Predicted Reshifting
+After slot selection, a KNN lookup over the historic dataset (k=20, filtered by laden status, container size, and assigned location) predicts the expected number of reshifts. This is returned alongside the recommended slot.
+
+---
+
+## Yards
+
+| Name | Key |
+|------|-----|
+| Yard One | `One` |
+| Yard Two | `Two` |
+| Yard Three | `Three` |
+| Yard R | `R` |
+| Yard M | `M` |
+
+---
 
 ## Project Structure
 
 ```
 YardOptimiser/
-├── milp_server.jl          Julia HTTP server (MILP solver + REST API)
-├── index.html              Web dashboard with chat widget (Power BI src not included)
+├── milp_server.jl             Julia HTTP server (MILP solver + REST API)
+├── index.html                 Web dashboard with chat widget (Power BI src not included)
 ├── MultiYard Optimiser.ipynb  Development notebook (same MILP logic)
-├── Project.toml            Julia package dependencies
-├── Manifest.toml           Julia dependency lock file
-├── Historic/               Per-yard historical container movement CSVs
-└── Yards/                  Per-yard current slot and occupancy state CSVs
+├── Project.toml               Julia package dependencies
+├── Historic/                  Per-yard historical container movement CSVs (not tracked)
+└── Yards/                     Per-yard current slot and occupancy state CSVs (not tracked)
 ```
 
-## Prerequisites
-
-- [Julia](https://julialang.org/downloads/) 1.9 or later
-- [ngrok](https://ngrok.com/) (optional — only needed to expose the server externally)
-
-## Power BI Dashboard
-
-The background dashboard iframe in `index.html` has its `src` removed from this repo. To restore it, set the `src` attribute of `#dashboard-frame` to your Power BI publish-to-web embed URL.
-
 ## Running the Server
+
+Requires [Julia](https://julialang.org/downloads/) 1.9+.
 
 ```bash
 julia milp_server.jl
 ```
 
-On first run, Julia will automatically install all dependencies via `Pkg.instantiate()`. This may take a few minutes.
-
-The server starts on `http://localhost:8080` and exposes:
+On first run, dependencies are installed automatically via `Pkg.instantiate()`. The server starts on `http://localhost:8080`.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/solve` | POST | Run the MILP and return the recommended slot |
 | `/health` | GET | Server health check |
 
-## Configuring the API URL
-
-By default `index.html` points to `http://localhost:8080` for local use. To expose the server externally, start an ngrok tunnel:
-
-```bash
-ngrok http 8080
-```
-
-Then update line 752 of `index.html` with your tunnel URL:
-
-```js
-const API_BASE = 'https://your-tunnel-id.ngrok-free.app';
-```
-
-See `.env.example` for the config template.
-
-## POST /solve — Request Format
+### Request Format
 
 ```json
 {
@@ -77,29 +108,23 @@ See `.env.example` for the config template.
 |-------|------|-------------|
 | `yard` | string | Yard name: `One`, `Two`, `Three`, `R`, or `M` |
 | `eta` | number | Estimated time of arrival in hours |
-| `width` | integer | `1` = 20ft container, `2` = 40ft container |
-| `laden` | integer | `1` = laden (full), `0` = empty |
-| `customer_id` | integer | Customer identifier for grouping preference |
+| `width` | integer | `1` = 20ft, `2` = 40ft |
+| `laden` | integer | `1` = laden, `0` = empty |
+| `customer_id` | integer | Customer ID for grouping preference |
 
 ## Data File Formats
 
-Data files are not tracked in version control. Place them in the correct directories before starting the server.
+Data files are not tracked in version control.
 
-**`Yards/<YardName>Slots.csv`** — physical slot definitions for each yard:
+**`Yards/<YardName>Slots.csv`** — physical slot definitions:
 `Location, Block, Column, Tier, OccupiedNow, Cost, AdjCost`
 
-**`Yards/<YardName>State.csv`** — current container occupancy snapshot:
+**`Yards/<YardName>State.csv`** — current occupancy snapshot:
 `MovementId, CustomerId, ContainerSize, Laden, Location, ETA_hours, WidthUnits, ShiftCount`
 
-**`Historic/<YardName>Historic.csv`** — historical movements for KNN-based shift prediction:
+**`Historic/<YardName>Historic.csv`** — historical movements for KNN prediction:
 `Laden, ContainerSize, Location, LocationList, Dwell, ShiftCount`
 
-## Yards
+## Power BI Dashboard
 
-| Name | Key |
-|------|-----|
-| Yard One | `One` |
-| Yard Two | `Two` |
-| Yard Three | `Three` |
-| Yard R | `R` |
-| Yard M | `M` |
+The background dashboard iframe in `index.html` has its `src` removed from this repo. To restore it, set the `src` attribute of `#dashboard-frame` to your Power BI publish-to-web embed URL.
